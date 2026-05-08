@@ -524,6 +524,8 @@
 			const caps = await window.LanguageModel.availability();
 			if (caps === 'unavailable') return false;
 			aiSession = await window.LanguageModel.create({
+				expectedInputs: [{ type: 'text', languages: ['zh', 'en'] }],
+				expectedOutputs: [{ type: 'text', languages: ['en'] }],
 				systemPrompt: [
 					'<role>',
 					'You are a deterministic field extractor for photo-contest submission email subjects. Output is parsed downstream as JSON to build identity-keyed filenames, so token-classification accuracy is critical.',
