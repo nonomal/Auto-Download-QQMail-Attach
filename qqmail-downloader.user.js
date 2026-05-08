@@ -1036,15 +1036,7 @@
 			const fh = await rootHandle.getFileHandle('manifest.json', { create: false });
 			const file = await fh.getFile();
 			const text = await file.text();
-			const data = JSON.parse(text);
-			// One-shot migration: legacy schema used `${mailid}_${fileid}` keys (no slash).
-			// New schema is `${dir}/${filename}`. Drop legacy entries — they get rebuilt
-			// from disk on the next scan.
-			const migrated = {};
-			for (const [k, v] of Object.entries(data)) {
-				if (typeof k === 'string' && k.includes('/')) migrated[k] = v;
-			}
-			return migrated;
+			return JSON.parse(text);
 		} catch (e) {
 			return {};
 		}
