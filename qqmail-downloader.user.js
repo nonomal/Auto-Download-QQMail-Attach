@@ -1676,7 +1676,9 @@
 			}
 		}
 
-		buildIdentityMap(attachments);
+		// Build over allMails (not just attachments) so senders of inline-only mails
+		// also enter identityMap and become eligible for AI subject parsing.
+		buildIdentityMap(allMails);
 		buildMailMapFromAttach(attachments);
 
 		const markUnreadPromise = markAllUnread();
