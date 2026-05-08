@@ -604,12 +604,17 @@
 	async function enhanceIdentityWithAI(allMails, onProgress) {
 		if (!aiAvailable) return { count: 0, items: [] };
 
+		// Dedup at intake so the displayed denominator equals the actual LLM call count.
+		// Without this, multiple mails from the same sender all inflate `needAI.length`
+		// even though we only prompt the model once per sender.
 		const needAI = [];
+		const queued = new Set();
 		for (const mail of allMails) {
 			const email = mail.senders?.item?.[0]?.email;
-			if (!email) continue;
+			if (!email || queued.has(email)) continue;
 			const id = identityMap.get(email);
 			if (id && id.names.size === 0 && mail.subject) {
+				queued.add(email);
 				needAI.push(mail);
 			}
 		}
@@ -619,12 +624,9 @@
 		// items: full record of every successful subject parse — surfaced in the panel
 		// and report so the user can audit what the on-device LM actually pulled out.
 		const items = [];
-		const seen = new Set();
 		for (let i = 0; i < needAI.length; i++) {
 			const mail = needAI[i];
 			const email = mail.senders?.item?.[0]?.email;
-			if (seen.has(email)) continue;
-			seen.add(email);
 
 			onProgress?.(`AI 解析 ${i + 1}/${needAI.length}`);
 			const parsed = await aiParseSubject(mail.subject);
