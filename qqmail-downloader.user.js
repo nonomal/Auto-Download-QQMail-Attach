@@ -750,7 +750,7 @@
 				const identity = getIdentity(senderEmail);
 				const idSegs = buildIdentitySegs(identity);
 				// Identity-empty fallback: use sender's local-part so we never produce
-				// nameless files like "内嵌1.jpg". Last resort is mailIdx.
+				// nameless files. Last resort is mailIdx.
 				const baseSegs = idSegs.length > 0 ? idSegs : [senderEmail.split('@')[0] || `mail${mailIdx}`];
 
 				for (let pi = 0; pi < picList.length; pi++) {
@@ -760,10 +760,10 @@
 					const nameMatch = (pic.name || '').match(/\.([a-zA-Z0-9]{2,5})$/);
 					if (nameMatch) ext = nameMatch[1].toLowerCase();
 
-					// mailIdx keeps multiple no-attach mails from the same sender from
-					// colliding on disk; picIdx splits multi-pic mails further.
-					const picSeg = picList.length > 1 ? `内嵌${mailIdx}-${pi + 1}` : `内嵌${mailIdx}`;
-					const filename = sanitizeFilename([...baseSegs, picSeg].join('_') + '.' + ext);
+					// Format: <name>-<qq>-<phone>-<picIdx>.<ext>, mirroring the dash-joined
+					// convention used elsewhere. Cross-mail collisions (same identity, multiple
+					// no-attach mails) are resolved by the dedup pass below.
+					const filename = sanitizeFilename([...baseSegs, pi + 1].join('-') + '.' + ext);
 
 					inlineEntries.push({
 						url: ensureAbsoluteUrl(pic.downloadurl || ''),
@@ -772,6 +772,8 @@
 						filename,
 						mailid: mail.emailid,
 						fileid: pic.fileid || `inline_${pi}`,
+						fileIndex: pi + 1,
+						email: senderEmail,
 						size: pic.size || 0,
 						isInline: true,
 						senderEmail,
@@ -782,11 +784,34 @@
 			}
 		}
 
-		// Pass 1-based mailIdx so it shows up in filenames as 内嵌1, 内嵌2, ...
+		// mailIdx is only kept around as a synthetic fallback when sender local-part is missing.
 		for (let i = 0; i < noAttachMails.length; i += 5) {
 			const slice = noAttachMails.slice(i, i + 5);
 			await Promise.all(slice.map((m, j) => processOne(m, i + j + 1)));
 		}
+
+		// Dedup within DIR_INLINE — same-identity senders mailing more than once would
+		// otherwise produce identical "name-qq-phone-1.jpg" filenames and overwrite each
+		// other on disk. Mirrors the (n) suffix scheme used in buildDownloadListFromAttach.
+		const taken = new Set();
+		const dirKey = (n, d) => `${d}/${n}`.toLowerCase();
+		for (const entry of inlineEntries) {
+			if (!taken.has(dirKey(entry.filename, entry.dir))) {
+				taken.add(dirKey(entry.filename, entry.dir));
+				continue;
+			}
+			const dot = entry.filename.lastIndexOf('.');
+			const stem = dot > 0 ? entry.filename.slice(0, dot) : entry.filename;
+			const ext = dot > 0 ? entry.filename.slice(dot) : '';
+			let n = 2;
+			let cand;
+			do {
+				cand = `${stem} (${n++})${ext}`;
+			} while (taken.has(dirKey(cand, entry.dir)));
+			entry.filename = cand;
+			taken.add(dirKey(cand, entry.dir));
+		}
+
 		return { inlineEntries, emptyMails };
 	}
 
@@ -912,6 +937,7 @@
 
 		const downloads = [];
 		let id = 0;
+		const perMailIdx = new Map();
 
 		for (const a of attachments) {
 			let { stem: origName, ext } = resolveStemExt(a);
@@ -950,6 +976,9 @@
 
 			const url = ensureAbsoluteUrl(a.download_url || '');
 
+			const fileIndex = (perMailIdx.get(a.mailid) || 0) + 1;
+			perMailIdx.set(a.mailid, fileIndex);
+
 			const task = {
 				id: id++,
 				folderId,
@@ -958,6 +987,8 @@
 				filename,
 				mailid: a.mailid,
 				fileid: a.fileid,
+				fileIndex,
+				email: sender,
 				status: 'pending',
 			};
 			const gk = dupGroupMap.get(dk);
@@ -1005,7 +1036,15 @@
 			const fh = await rootHandle.getFileHandle('manifest.json', { create: false });
 			const file = await fh.getFile();
 			const text = await file.text();
-			return JSON.parse(text);
+			const data = JSON.parse(text);
+			// One-shot migration: legacy schema used `${mailid}_${fileid}` keys (no slash).
+			// New schema is `${dir}/${filename}`. Drop legacy entries — they get rebuilt
+			// from disk on the next scan.
+			const migrated = {};
+			for (const [k, v] of Object.entries(data)) {
+				if (typeof k === 'string' && k.includes('/')) migrated[k] = v;
+			}
+			return migrated;
 		} catch (e) {
 			return {};
 		}
@@ -1025,8 +1064,14 @@
 	// Debounce: coalesce bursts of appends from parallel workers into at most one write per 2s.
 	async function manifestAppend(entry) {
 		if (!manifestCache) manifestCache = await readManifest();
-		const key = `${entry.mailid}_${entry.fileid}`;
-		const val = { dir: entry.dir, filename: entry.filename, size: entry.size, time: Date.now() };
+		const key = `${entry.dir}/${entry.filename}`;
+		const val = {
+			emailid: entry.mailid,
+			file_index: entry.fileIndex,
+			email: entry.email,
+			size: entry.size,
+			time: Date.now(),
+		};
 		if (entry.keptBy) val.keptBy = entry.keptBy;
 		manifestCache[key] = val;
 		manifestDirty = true;
@@ -1317,7 +1362,7 @@
 				await w.write(blob);
 				await w.close();
 				task.status = 'done';
-				await manifestAppend({ mailid: task.mailid, fileid: task.fileid, dir: task.dir, filename: task.filename, size: blob.size, keptBy: task.keptBy });
+				await manifestAppend({ mailid: task.mailid, fileIndex: task.fileIndex, email: task.email, dir: task.dir, filename: task.filename, size: blob.size, keptBy: task.keptBy });
 			} catch (e) {
 				if (e.message === 'session_expired') throw e; // bubble up for retry; caller requeues
 				task.status = 'failed';
@@ -1812,7 +1857,7 @@
 		let alreadyDownloaded = 0;
 		let manifestRebuilt = false;
 		for (const task of downloads) {
-			const mKey = `${task.mailid}_${task.fileid}`;
+			const mKey = `${task.dir}/${task.filename}`;
 			const fileMap = diskFileSet.get(task.dir);
 			const fileHandle = fileMap?.get(task.filename);
 			const onDisk = !!fileHandle;
@@ -1824,7 +1869,13 @@
 				if (!inManifest) {
 					try {
 						const file = await fileHandle.getFile();
-						manifestCache[mKey] = { dir: task.dir, filename: task.filename, size: file.size, time: Date.now() };
+						manifestCache[mKey] = {
+							emailid: task.mailid,
+							file_index: task.fileIndex,
+							email: task.email,
+							size: file.size,
+							time: Date.now(),
+						};
 						manifestRebuilt = true;
 					} catch {}
 				}
@@ -1996,7 +2047,7 @@
 
 		let skipped = 0;
 		for (const task of pending) {
-			const key = `${task.mailid}_${task.fileid}`;
+			const key = `${task.dir}/${task.filename}`;
 			if (manifestKeys.has(key)) {
 				task.status = 'done';
 				await dbPut('tasks', task);
