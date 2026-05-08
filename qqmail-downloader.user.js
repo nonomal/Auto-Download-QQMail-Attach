@@ -43,6 +43,21 @@
 	const DIR_OTHER = '其他';
 	const DIR_MANUAL = '转人工';
 
+	// ASCII type tags used in manifest keys — keeps keys URL-safe and tool-friendly,
+	// independent of the on-disk Chinese folder names (which can be renamed).
+	const DIR_TO_TYPE = {
+		[DIR_IMAGE]: 'image',
+		[DIR_INLINE]: 'inline',
+		[DIR_PROJECT]: 'project',
+		[DIR_DOC]: 'doc',
+		[DIR_AUDIO]: 'audio',
+		[DIR_VIDEO]: 'video',
+		[DIR_ARCHIVE]: 'archive',
+		[DIR_DUP]: 'dup',
+		[DIR_OTHER]: 'other',
+		[DIR_MANUAL]: 'manual',
+	};
+
 	// `detailTitle` absent → category has a custom report section (DUP / MANUAL) instead of a plain listing.
 	const DIR_META = [
 		{ name: DIR_IMAGE, desc: 'jpg/png/webp/heic/ 等', detailTitle: '图片清单' },
@@ -73,6 +88,8 @@
 	let folderName = '';
 	let identityMap = new Map();
 	let mailMap = {};
+	// email (lowercased) → { quanpin, jianpin, remark } from /addr/addrlist
+	let addrMap = new Map();
 
 	// ============================================================
 	//  Utilities
@@ -430,6 +447,52 @@
 		return true;
 	}
 
+	// QQ Mail's contact book carries pre-computed pinyin (`quanpin`) and initials
+	// (`jianpin`) for every contact. We use them as ASCII identity tokens in
+	// manifest keys so the file index stays tool-friendly even when the on-disk
+	// Chinese folder/filename gets renamed.
+	async function fetchAddrList() {
+		try {
+			const data = await apiGet(`/addr/addrlist?sid=${sid}`);
+			if (data?.head?.ret !== 0) return new Map();
+			const list = data.body?.list || data.body?.addr_list || data.body || [];
+			const arr = Array.isArray(list) ? list : [];
+			const map = new Map();
+			for (const item of arr) {
+				const mails = item.mail || [];
+				for (const m of mails) {
+					if (!m) continue;
+					map.set(m.toLowerCase(), {
+						quanpin: item.quanpin || '',
+						jianpin: item.jianpin || '',
+						remark: item.remark || '',
+					});
+				}
+			}
+			return map;
+		} catch {
+			return new Map();
+		}
+	}
+
+	function getQuanpin(email) {
+		if (!email) return 'unknown';
+		const info = addrMap.get(email.toLowerCase());
+		if (info?.quanpin) return info.quanpin;
+		if (info?.jianpin) return info.jianpin;
+		// Final fallback: email local-part. QQ-numeric mailboxes get a `qq` prefix
+		// so the token reads like an identity rather than a bare number.
+		const local = (email.split('@')[0] || '').toLowerCase();
+		if (!local) return 'unknown';
+		return /^\d+$/.test(local) ? `qq${local}` : local;
+	}
+
+	function buildManifestKey(entry) {
+		const type = DIR_TO_TYPE[entry.dir] || 'other';
+		const quanpin = entry.quanpin || getQuanpin(entry.email);
+		return `${type}_${quanpin}_${entry.mailid}_${entry.fileid}`;
+	}
+
 	// ============================================================
 	//  Phase 2: Scan mails
 	// ============================================================
@@ -581,10 +644,6 @@
 
 	async function aiParseSubject(subject) {
 		if (!aiSession || !subject) return null;
-		// Few-shot anchors the on-device model on the recurring `<contest> <entrant> <qq> <phone> [<work>]` layout.
-		// XML tags help the model distinguish examples from the actual input. Subjects remain in
-		// native Chinese; structural tags and instructions are English to avoid the model echoing
-		// Chinese boilerplate back into the JSON.
 		const prompt = [
 			'<examples>',
 			'<example>',
@@ -776,6 +835,7 @@
 						fileid: pic.fileid || `inline_${pi}`,
 						fileIndex: pi + 1,
 						email: senderEmail,
+						quanpin: getQuanpin(senderEmail),
 						size: pic.size || 0,
 						isInline: true,
 						senderEmail,
@@ -991,6 +1051,7 @@
 				fileid: a.fileid,
 				fileIndex,
 				email: sender,
+				quanpin: getQuanpin(sender),
 				status: 'pending',
 			};
 			const gk = dupGroupMap.get(dk);
@@ -1058,11 +1119,14 @@
 	// Debounce: coalesce bursts of appends from parallel workers into at most one write per 2s.
 	async function manifestAppend(entry) {
 		if (!manifestCache) manifestCache = await readManifest();
-		const key = `${entry.dir}/${entry.filename}`;
+		const key = buildManifestKey(entry);
 		const val = {
 			emailid: entry.mailid,
+			fileid: entry.fileid,
 			file_index: entry.fileIndex,
 			email: entry.email,
+			dir: entry.dir,
+			filename: entry.filename,
 			size: entry.size,
 			time: Date.now(),
 		};
@@ -1356,7 +1420,7 @@
 				await w.write(blob);
 				await w.close();
 				task.status = 'done';
-				await manifestAppend({ mailid: task.mailid, fileIndex: task.fileIndex, email: task.email, dir: task.dir, filename: task.filename, size: blob.size, keptBy: task.keptBy });
+				await manifestAppend({ mailid: task.mailid, fileid: task.fileid, fileIndex: task.fileIndex, email: task.email, quanpin: task.quanpin, dir: task.dir, filename: task.filename, size: blob.size, keptBy: task.keptBy });
 			} catch (e) {
 				if (e.message === 'session_expired') throw e; // bubble up for retry; caller requeues
 				task.status = 'failed';
@@ -1710,6 +1774,11 @@
 			return;
 		}
 
+		// Kick off contact-book fetch in parallel — we need it before building the
+		// download list (manifest keys embed quanpin), but it's slow enough that
+		// running it alongside scanAllMails cuts overall startup latency.
+		const addrPromise = fetchAddrList();
+
 		const allFolders = [...(folderData.body.list.personal_list || []), ...(folderData.body.list.sys_list || [])];
 		const folder = allFolders.find(f => f.dirid === folderId);
 		folderName = folder?.name || `文件夹${folderId}`;
@@ -1767,6 +1836,11 @@
 
 		updateScanMessage(`检查撤回和空邮件...`);
 		const { recalled } = await processRecalledMails(allMails, updateScanMessage);
+
+		// quanpin/jianpin must be in place before any task or inline entry is built —
+		// manifest keys reference them, and a half-populated addrMap would scatter the
+		// same sender across two key namespaces (quanpin + email-fallback).
+		addrMap = await addrPromise;
 
 		const noAttachMails = allMails.filter(m => !hasAttachments(m) && !(m.subject || '').startsWith('发信方已撤回邮件：'));
 		const sendersWithAttach = new Set(attachments.map(a => a.sender?.addr).filter(Boolean));
@@ -1851,7 +1925,7 @@
 		let alreadyDownloaded = 0;
 		let manifestRebuilt = false;
 		for (const task of downloads) {
-			const mKey = `${task.dir}/${task.filename}`;
+			const mKey = buildManifestKey(task);
 			const fileMap = diskFileSet.get(task.dir);
 			const fileHandle = fileMap?.get(task.filename);
 			const onDisk = !!fileHandle;
@@ -1865,8 +1939,11 @@
 						const file = await fileHandle.getFile();
 						manifestCache[mKey] = {
 							emailid: task.mailid,
+							fileid: task.fileid,
 							file_index: task.fileIndex,
 							email: task.email,
+							dir: task.dir,
+							filename: task.filename,
 							size: file.size,
 							time: Date.now(),
 						};
@@ -2033,6 +2110,10 @@
 		}
 
 		showScanningUI('读取本地已有文件...');
+		// Tasks loaded from IndexedDB carry their own quanpin, but tasks predating
+		// the schema change won't — refresh addrMap so getQuanpin's fallback path
+		// matches what the original run wrote.
+		if (addrMap.size === 0) addrMap = await fetchAddrList();
 		manifestCache = await readManifest();
 		const manifestKeys = new Set(Object.keys(manifestCache));
 
@@ -2041,7 +2122,7 @@
 
 		let skipped = 0;
 		for (const task of pending) {
-			const key = `${task.dir}/${task.filename}`;
+			const key = buildManifestKey(task);
 			if (manifestKeys.has(key)) {
 				task.status = 'done';
 				await dbPut('tasks', task);
