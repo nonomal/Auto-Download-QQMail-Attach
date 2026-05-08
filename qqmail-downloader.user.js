@@ -455,10 +455,9 @@
 		try {
 			const data = await apiGet(`/addr/addrlist?sid=${sid}`);
 			if (data?.head?.ret !== 0) return new Map();
-			const list = data.body?.list || data.body?.addr_list || data.body || [];
-			const arr = Array.isArray(list) ? list : [];
+			const items = data.body?.addr_list?.items || [];
 			const map = new Map();
-			for (const item of arr) {
+			for (const item of items) {
 				const mails = item.mail || [];
 				for (const m of mails) {
 					if (!m) continue;
