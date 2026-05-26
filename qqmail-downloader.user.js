@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QQ Mail 附件批量下载
 // @description  批量下载QQ邮箱附件，提取全部附件，智能分类命名
-// @version      3.1.2
+// @version      3.4.0
 // @author       XHXIAIEIN
 // @namespace    https://greasyfork.org/zh-CN/scripts/535160
 // @supportURL   https://github.com/xhxiaiein/Auto-Download-QQMail-Attach
@@ -14,23 +14,35 @@
 	'use strict';
 
 	// ============================================================
-	//  Constants
+	//  用户配置
 	// ============================================================
 
-	const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'bmp', 'tiff', 'tif', 'raw', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'raf']);
-	const PROJECT_EXTS = new Set(['psd', 'ai', 'sketch', 'fig', 'xd', 'indd', 'cdr', 'eps', 'afdesign', 'afphoto', 'blend', 'c4d', 'max', 'ma', 'mb']);
-	const DOC_EXTS = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'md', 'epub']);
-	const AUDIO_EXTS = new Set(['mp3', 'wav', 'aac', 'flac', 'ogg', 'wma', 'm4a', 'ape', 'alac']);
-	const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'mpg', 'mpeg', 'm4v', 'gif']);
-	const ARCHIVE_EXTS = new Set(['zip', 'rar', '7z', 'gz', 'tar', 'bz2', 'xz', 'zst']);
+	const SCAN_SUBFOLDERS = true; // 扫描已下载时是否递归子目录
+	const CONCURRENCY = 10; // 并发下载数
 
-	const DB_NAME = 'mail_downloader_db';
-	const DB_VERSION = 30000;
-	const CONCURRENCY = 10;
+	// 落盘目录组织方式
+	//   'type'        默认。按文件类型一级分类：图片/、文档/、视频/...
+	//   'subject'     按邮件主题
+	//   'sender'      按发件人昵称（缺省回退到邮箱 local-part）
+	//   'email'       按完整发件人邮箱地址
+	//   'pinyin'      按发件人 pinyin 首字母：A-Z / 0-9 / _其他
+	//   'time-month'  按月：YYYY-MM
+	//   'time-week'   按周：YYYY-Www
+	//   'time-day'    按日：YYYY-MM-DD
+	//   'time-hour'   按小时：YYYY-MM-DD-HH
+	//   'time-period' 按时段：YYYY-MM-DD-上午/下午/晚上（5/12/18 三段）
+	const SAVE_MODE = 'type';
 
-	// Recurse into subfolders when scanning for already-downloaded files. Turn off if
-	// the chosen root contains unrelated trees and a flat scan is more predictable.
-	const SCAN_SUBFOLDERS = true;
+	// QQ 邮箱标签 ID（按需启用）。默认 null = 不打。
+	// 启用：邮箱里建标签 → 打开它 → 把 URL 里的 tagid 填进来。填错或不存在会自动跳过。
+	const TAG_NO_ATTACH = null;
+	const TAG_READ = null;
+	const TAG_DOWNLOADED = null;
+	const TAG_DUPLICATE = null;
+
+	// ============================================================
+	//  Constants
+	// ============================================================
 
 	const DIR_IMAGE = '图片';
 	const DIR_INLINE = '内嵌图片';
@@ -42,39 +54,6 @@
 	const DIR_DUP = '重复';
 	const DIR_OTHER = '其他';
 	const DIR_MANUAL = '转人工';
-
-	// ASCII type tags used in manifest keys — keeps keys URL-safe and tool-friendly,
-	// independent of the on-disk Chinese folder names (which can be renamed).
-	const DIR_TO_TYPE = {
-		[DIR_IMAGE]: 'image',
-		[DIR_INLINE]: 'inline',
-		[DIR_PROJECT]: 'project',
-		[DIR_DOC]: 'doc',
-		[DIR_AUDIO]: 'audio',
-		[DIR_VIDEO]: 'video',
-		[DIR_ARCHIVE]: 'archive',
-		[DIR_DUP]: 'dup',
-		[DIR_OTHER]: 'other',
-		[DIR_MANUAL]: 'manual',
-	};
-
-	// `detailTitle` absent → category has a custom report section (DUP / MANUAL) instead of a plain listing.
-	const DIR_META = [
-		{ name: DIR_IMAGE, desc: 'jpg/png/webp/heic/ 等', detailTitle: '图片清单' },
-		{ name: DIR_INLINE, desc: '正文嵌入图片', detailTitle: '内嵌图片清单' },
-		{ name: DIR_PROJECT, desc: 'psd/ai/sketch/xd 等', detailTitle: '项目文件清单' },
-		{ name: DIR_DOC, desc: 'pdf/doc/xls/ppt 等', detailTitle: '文档清单' },
-		{ name: DIR_AUDIO, desc: 'mp3/wav/flac 等', detailTitle: '音频清单' },
-		{ name: DIR_VIDEO, desc: 'mp4/mov/avi 等', detailTitle: '视频清单' },
-		{ name: DIR_ARCHIVE, desc: 'zip/rar/7z 等', detailTitle: '压缩文件清单' },
-		{ name: DIR_DUP, desc: '已保留最新' },
-		{ name: DIR_OTHER, desc: '未归类格式', detailTitle: '其他文件清单' },
-		{ name: DIR_MANUAL, desc: '第三方链接' },
-	];
-
-	const TAG_NO_ATTACH = 4001;
-	const TAG_READ = 4004;
-	const TAG_DOWNLOADED = 4008;
 
 	// ============================================================
 	//  State
@@ -88,7 +67,6 @@
 	let folderName = '';
 	let identityMap = new Map();
 	let mailMap = {};
-	// email (lowercased) → { quanpin, jianpin, remark } from /addr/addrlist
 	let addrMap = new Map();
 
 	// ============================================================
@@ -157,6 +135,22 @@
 
 		if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i.test(s)) s = '_' + s;
 		return s || 'unnamed';
+	}
+
+	// 相机/IM 自动生成名（微信图片_xxx、mmexport_xxx、IMG_xxx、Screenshot_xxx、DSC_xxx
+	// 等）内容无关——时间戳/序号每次转发都会变，且同一发件人重复出现的同型名几乎都是
+	// 不同作品，因此直接跳出 dedup，让普通的同名碰撞重命名（` (2)`）兜底盘上冲突。
+	const AUTO_NAME_PATTERNS = [/^微信图片_[\d_]+\.[A-Za-z0-9]+$/, /^QQ图片\d+\.[A-Za-z0-9]+$/, /^mmexport\d+\.[A-Za-z0-9]+$/i, /^IMG[-_]\d[\d_]*\.[A-Za-z0-9]+$/i, /^Screenshot[-_]?\d[\d\-_:.\s]*\.[A-Za-z0-9]+$/i, /^(DSC|DSCN|DSCF)\d+\.[A-Za-z0-9]+$/i];
+	function isAutoGenNfcName(nfcName) {
+		return AUTO_NAME_PATTERNS.some(re => re.test(nfcName));
+	}
+
+	// QQ 邮件接口里的时间多为秒级 unix 时间戳；ts 是 0/undefined 时返回空串方便表格直接拼接。
+	function fmtDatetime(ts) {
+		if (!ts) return '';
+		const d = new Date(ts * 1000);
+		const pad = n => String(n).padStart(2, '0');
+		return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 	}
 
 	// HTML-escape before writing to innerHTML. Mail subject / sender nick / attachment name
@@ -258,20 +252,19 @@
 
 	function buildIdentitySegs(identity) {
 		const s = [];
-		if (identity.name) s.push(identity.name);
+		if (identity.parsedName) s.push(identity.parsedName);
 		if (identity.qq) s.push(identity.qq);
 		if (identity.phone) s.push(identity.phone);
+		if (s.length === 0) {
+			// 标题/附件/AI/搜索都没解析到身份字段 — 用发件人显示名 + 邮箱 local-part
+			// 兜底，让文件名至少能区分发件人。
+			if (identity.nick) s.push(identity.nick);
+			if (identity.email) {
+				const local = identity.email.split('@')[0];
+				if (local && local !== identity.nick) s.push(local);
+			}
+		}
 		return s;
-	}
-
-	function countByDir(tasks) {
-		const s = {};
-		for (const t of tasks) s[t.dir] = (s[t.dir] || 0) + 1;
-		return s;
-	}
-
-	function formatDirStats(stats) {
-		return DIR_META.map(({ name }) => (name === DIR_IMAGE ? `${name} ${stats[name] || 0}` : stats[name] ? `${name} ${stats[name]}` : '')).filter(Boolean);
 	}
 
 	async function batchParallel(items, concurrency, fn) {
@@ -320,6 +313,9 @@
 	// ============================================================
 	//  IndexedDB
 	// ============================================================
+
+	const DB_NAME = 'mail_downloader_db';
+	const DB_VERSION = 30000;
 
 	function openDB() {
 		return new Promise((resolve, reject) => {
@@ -416,16 +412,43 @@
 		return data;
 	}
 
+	// Global mailbox-wide search. We use it to harvest identity tokens (QQ / phone /
+	// name) from a sender's historical subjects when the currently downloaded mails
+	// don't carry the standard "name+qq+phone+work" pattern.
+	async function fetchSearchByKeyword(keyword, pageSize = 50) {
+		const data = await apiPost('/list/search', { page_now: 0, page_size: pageSize, keyword });
+		if (data.head?.ret !== 0) return [];
+		return data.body?.list || [];
+	}
+
 	async function markMailRead(mailId) {
 		return apiPost('/mgr/mailmgr', { func: 4, mailid: mailId, folderid: folderId, choose_type: 1 });
 	}
 
+	// 未配置 (null) → 静默跳过。
+	// 配置了但服务端首次返回非 0 (tagid 不存在 / 被删 / 无权限) → 拉黑本会话后续同 id 调用。
+	// 网络异常不入黑名单（可能只是临时抖动），由调用方的 .catch 兜住。
+	const failedTagIds = new Set();
 	async function addTag(mailId, tagId) {
-		return apiPost('/mgr/mailmgr', { func: 12, mailid: mailId, tagid: tagId, folderid: folderId, choose_type: 1 });
+		if (tagId == null) return;
+		if (failedTagIds.has(tagId)) return;
+		const r = await apiPost('/mgr/mailmgr', { func: 12, mailid: mailId, tagid: tagId, folderid: folderId, choose_type: 1 });
+		if (r?.head?.ret !== 0) {
+			failedTagIds.add(tagId);
+		}
 	}
 
 	async function addTags(mailId, tagIds) {
 		await Promise.all(tagIds.map(t => addTag(mailId, t)));
+	}
+
+	// 仅当用户配置了 TAG_DUPLICATE 时才打标，重复方邮件按 mailid 去重。
+	async function tagDuplicateMails(tasks, onProgress) {
+		if (TAG_DUPLICATE == null) return;
+		const dupMails = [...new Set(tasks.filter(t => (t.category || t.dir) === DIR_DUP && t.status === 'done').map(t => t.mailid))];
+		if (dupMails.length === 0) return;
+		onProgress?.(dupMails.length);
+		await batchParallel(dupMails, 10, mid => addTag(mid, TAG_DUPLICATE).catch(() => {}));
 	}
 
 	async function pollAsyncTask(taskId) {
@@ -486,8 +509,118 @@
 		return /^\d+$/.test(local) ? `qq${local}` : local;
 	}
 
+	// 发件人 pinyin 首字母分类的入口；非字母数字（含直接以中文备注开头）落入 _其他。
+	function getPinyinInitial(email) {
+		const info = addrMap.get((email || '').toLowerCase());
+		let src = info?.jianpin || info?.quanpin || '';
+		if (!src) src = (email || '').split('@')[0] || '';
+		const c = (src.charAt(0) || '').toUpperCase();
+		if (/[A-Z0-9]/.test(c)) return c;
+		return '_其他';
+	}
+
+	function getTimePeriod(hour) {
+		if (hour >= 5 && hour < 12) return '上午';
+		if (hour >= 12 && hour < 18) return '下午';
+		return '晚上';
+	}
+
+	// ISO-8601 周序，跨年时归属遵守 ISO 规则（不是简单的 dayOfYear/7）。
+	function getIsoWeek(date) {
+		const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+		const day = d.getUTCDay() || 7;
+		d.setUTCDate(d.getUTCDate() + 4 - day);
+		const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+		const weekNo = Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
+		return { year: d.getUTCFullYear(), week: weekNo };
+	}
+
+	// 给定 task 的发件人/邮件信息算出当前 SAVE_MODE 下对应的 bucket。返回 null 表示
+	// 当前模式无 bucket（'type' / null / 未识别值），调用方回退到 category（平铺）。
+	const TIME_MODES = new Set(['time-month', 'time-week', 'time-day', 'time-hour', 'time-period']);
+	function computeSaveBucket(taskLite, mailInfo) {
+		const mode = SAVE_MODE;
+		if (mode === 'subject') {
+			const s = sanitizeFilename(mailInfo?.subject || '');
+			return s || '_无主题';
+		}
+		if (mode === 'sender') {
+			const nick = mailInfo?.senderNick || '';
+			const email = taskLite?.email || mailInfo?.senderEmail || '';
+			const name = nick || email.split('@')[0] || '';
+			const s = sanitizeFilename(name);
+			return s || '_未知发件人';
+		}
+		if (mode === 'email') {
+			const email = taskLite?.email || mailInfo?.senderEmail || '';
+			const s = sanitizeFilename(email);
+			return s || '_未知邮箱';
+		}
+		if (mode === 'pinyin') {
+			return getPinyinInitial(taskLite?.email || mailInfo?.senderEmail || '');
+		}
+		if (TIME_MODES.has(mode)) {
+			const ts = mailInfo?.totime;
+			if (!ts) return '_未知时间';
+			const d = new Date(ts * 1000);
+			const pad = n => String(n).padStart(2, '0');
+			const y = d.getFullYear();
+			const m = pad(d.getMonth() + 1);
+			const day = pad(d.getDate());
+			const h = pad(d.getHours());
+			if (mode === 'time-month') return `${y}-${m}`;
+			if (mode === 'time-week') {
+				const w = getIsoWeek(d);
+				return `${w.year}-W${String(w.week).padStart(2, '0')}`;
+			}
+			if (mode === 'time-day') return `${y}-${m}-${day}`;
+			if (mode === 'time-hour') return `${y}-${m}-${day}-${h}`;
+			return `${y}-${m}-${day}-${getTimePeriod(d.getHours())}`;
+		}
+		return null; // 'type' / null / 未识别值 → 回退平铺
+	}
+
+	// 把分类（文件类型）与 SAVE_MODE 决定的 bucket 合并成落盘相对路径。
+	// 重复/、转人工/ 始终保留为顶层目录，便于人工审核；其它分类被 bucket 替换。
+	function resolveSaveDir(category, taskLite, mailInfo) {
+		const bucket = computeSaveBucket(taskLite, mailInfo);
+		if (!bucket) return category;
+		if (category === DIR_DUP || category === DIR_MANUAL) {
+			return `${category}/${bucket}`;
+		}
+		return bucket;
+	}
+
+	// FSA 的 getDirectoryHandle 只接受单段 name，含 '/' 的相对路径需要逐级解析。
+	async function resolveDirHandle(root, relPath, { create }) {
+		const parts = String(relPath || '')
+			.split('/')
+			.filter(Boolean);
+		let cur = root;
+		for (const p of parts) {
+			cur = await cur.getDirectoryHandle(p, { create });
+		}
+		return cur;
+	}
+
+	// manifest 键用的 ASCII 类型，独立于可被重命名的中文目录。
+	const DIR_TO_TYPE = {
+		[DIR_IMAGE]: 'image',
+		[DIR_INLINE]: 'inline',
+		[DIR_PROJECT]: 'project',
+		[DIR_DOC]: 'doc',
+		[DIR_AUDIO]: 'audio',
+		[DIR_VIDEO]: 'video',
+		[DIR_ARCHIVE]: 'archive',
+		[DIR_DUP]: 'dup',
+		[DIR_OTHER]: 'other',
+		[DIR_MANUAL]: 'manual',
+	};
+
 	function buildManifestKey(entry) {
-		const type = DIR_TO_TYPE[entry.dir] || 'other';
+		// 优先 category（与 SAVE_MODE 解耦的稳定类型），缺失时回退 dir 兼容旧 DB 任务。
+		const cat = entry.category || entry.dir;
+		const type = DIR_TO_TYPE[cat] || 'other';
 		const quanpin = entry.quanpin || getQuanpin(entry.email);
 		return `${type}_${quanpin}_${entry.mailid}_${entry.fileid}`;
 	}
@@ -519,35 +652,62 @@
 	//  Phase 3: Build identity map
 	// ============================================================
 
+	function extractPhoneQQ(text, id) {
+		for (const r of findBoundedDigitRuns(text, /1[3-9]\d{9}/g)) id.phones.add(r.text);
+		for (const r of findBoundedDigitRuns(text, /(?<!\d)[1-9]\d{4,10}(?!\d)/g)) {
+			if (!/^1[3-9]\d{9}$/.test(r.text)) id.qqs.add(r.text);
+		}
+	}
+
+	function ensureIdentity(email) {
+		if (!identityMap.has(email)) {
+			identityMap.set(email, { names: new Set(), qqs: new Set(), phones: new Set(), nicks: new Set() });
+		}
+		return identityMap.get(email);
+	}
+
+	// Pull every identity-like token (name candidate, QQ, phone) out of a single
+	// subject string and merge it into the given id record. Shared between the
+	// initial buildIdentityMap pass and the search-enrichment fallback so the
+	// extraction rules stay in one place.
+	function applySubjectToIdentity(id, subject) {
+		if (!subject) return;
+		const parts = subject.split(/[+＋]/);
+		if (parts.length >= 4) id.names.add(parts[2].trim());
+		for (const p of parts) extractPhoneQQ(p, id);
+	}
+
+	// 把 AI 解析结果按 name/qq/phone 各自的合规闸门写回 id；返回 {name, qq, phone, work}
+	// 表示真正被接收的字段。AI 主题解析与搜索补全两条路径共用，保证字段闸规则只在一处。
+	function applyParsedToIdentity(id, parsed) {
+		const accepted = { name: '', qq: '', phone: '', work: parsed.work || '' };
+		if (looksLikePersonName(parsed.name)) {
+			id.names.add(parsed.name);
+			accepted.name = parsed.name;
+		}
+		if (parsed.qq && /^\d{5,11}$/.test(parsed.qq)) {
+			id.qqs.add(parsed.qq);
+			accepted.qq = parsed.qq;
+		}
+		if (parsed.phone && /^1[3-9]\d{9}$/.test(parsed.phone)) {
+			id.phones.add(parsed.phone);
+			accepted.phone = parsed.phone;
+		}
+		return accepted;
+	}
+
 	// Accepts both attach_list entries and legacy mail objects.
 	function buildIdentityMap(items) {
 		identityMap = new Map();
-
-		function extractPhoneQQ(text, id) {
-			for (const r of findBoundedDigitRuns(text, /1[3-9]\d{9}/g)) id.phones.add(r.text);
-			for (const r of findBoundedDigitRuns(text, /(?<!\d)[1-9]\d{4,10}(?!\d)/g)) {
-				if (!/^1[3-9]\d{9}$/.test(r.text)) id.qqs.add(r.text);
-			}
-		}
-
-		function ensure(email) {
-			if (!identityMap.has(email)) {
-				identityMap.set(email, { names: new Set(), qqs: new Set(), phones: new Set(), nicks: new Set() });
-			}
-			return identityMap.get(email);
-		}
-
 		for (const item of items) {
 			const email = item.sender?.addr || getSenderEmail(item);
 			const nick = item.sender?.name || getSenderNick(item);
 			if (!email) continue;
 
-			const id = ensure(email);
+			const id = ensureIdentity(email);
 			if (nick) id.nicks.add(nick);
 
-			const parts = (item.subject || '').split(/[+＋]/);
-			if (parts.length >= 4) id.names.add(parts[2].trim());
-			for (const p of parts) extractPhoneQQ(p, id);
+			applySubjectToIdentity(id, item.subject || '');
 
 			const eqq = email.match(/^(\d{5,11})@qq\.com$/);
 			if (eqq) id.qqs.add(eqq[1]);
@@ -563,13 +723,19 @@
 
 	function getIdentity(email) {
 		const id = identityMap.get(email);
-		if (!id) return { name: '', qq: '', phone: '' };
-		const qqs = cleanQQs([...id.qqs]);
+		if (!id) return { name: '', parsedName: '', qq: '', phone: '', nick: '', email: email || '' };
 		const pickNonDigit = set => [...set].find(n => n && !/^\d+$/.test(n)) || '';
+		const parsedName = pickNonDigit(id.names);
+		const nick = pickNonDigit(id.nicks);
 		return {
-			name: pickNonDigit(id.names) || pickNonDigit(id.nicks) || '',
-			qq: qqs[0] || '',
+			// `name` 保持原有 nick-fallback 行为，供 UI/report 等外部消费者使用；
+			// 文件名构造请用 `parsedName`，只在 `buildIdentitySegs` 内决定何时回退到 nick + email。
+			name: parsedName || nick || '',
+			parsedName,
+			qq: cleanQQs([...id.qqs])[0] || '',
 			phone: [...id.phones][0] || '',
+			nick,
+			email: email || '',
 		};
 	}
 
@@ -706,7 +872,10 @@
 			const email = mail.senders?.item?.[0]?.email;
 			if (!email || queued.has(email)) continue;
 			const id = identityMap.get(email);
-			if (id && id.names.size === 0 && mail.subject) {
+			// id.aiTried is set by enrichIdentityFromSearch after it has already
+			// invoked aiParseSubject on the richest historical subject — skipping
+			// here avoids a redundant LLM call on a weaker local subject.
+			if (id && id.names.size === 0 && !id.aiTried && mail.subject) {
 				queued.add(email);
 				needAI.push(mail);
 			}
@@ -726,19 +895,7 @@
 			if (!parsed) continue;
 
 			const id = identityMap.get(email);
-			const accepted = { name: '', qq: '', phone: '', work: parsed.work || '' };
-			if (looksLikePersonName(parsed.name)) {
-				id.names.add(parsed.name);
-				accepted.name = parsed.name;
-			}
-			if (parsed.qq && /^\d{5,11}$/.test(parsed.qq)) {
-				id.qqs.add(parsed.qq);
-				accepted.qq = parsed.qq;
-			}
-			if (parsed.phone && /^1[3-9]\d{9}$/.test(parsed.phone)) {
-				id.phones.add(parsed.phone);
-				accepted.phone = parsed.phone;
-			}
+			const accepted = applyParsedToIdentity(id, parsed);
 
 			// Skip work-only rows — a parsed work title without any identity field
 			// doesn't change the filename, so surfacing it in the panel only adds noise.
@@ -754,6 +911,117 @@
 
 		// count = emails whose name field was filled — kept for backward compat with
 		// downstream stats. items.length may be larger (qq-only / phone-only matches).
+		const count = items.filter(it => it.parsed.name).length;
+		return { count, items };
+	}
+
+	// Score subjects by how parser-friendly they look — most separator-delimited
+	// tokens within a reasonable length window — so a single LLM call works on
+	// the richest example rather than wasting it on a one-liner.
+	function pickRichestSubject(subjects) {
+		let best = null;
+		let bestScore = -1;
+		for (const s of subjects) {
+			if (!s || s.length < 10 || s.length > 120) continue;
+			const score = s.split(/[+＋\-_]/).length;
+			if (score > bestScore) {
+				bestScore = score;
+				best = s;
+			}
+		}
+		return best;
+	}
+
+	// Phase 3a-bis: for senders whose identity is still incomplete after the
+	// local-subject pass, hit /list/search and harvest tokens from their
+	// historical subjects. Regex-only as long as it pulls something useful;
+	// only senders whose name still ends up empty fall back to a single AI
+	// parse on the richest harvested subject. Runs in parallel with
+	// initBuiltinAI — stage 2 awaits aiReadyPromise internally so the user
+	// never sees a dedicated "search" step.
+	async function enrichIdentityFromSearch(allMails, aiReadyPromise) {
+		const targets = [];
+		const seen = new Set();
+		for (const mail of allMails) {
+			const email = mail.senders?.item?.[0]?.email;
+			if (!email || seen.has(email)) continue;
+			seen.add(email);
+			const cur = getIdentity(email);
+			if (!cur.name || (!cur.qq && !cur.phone)) targets.push(email);
+		}
+
+		if (targets.length === 0) return { count: 0, items: [] };
+
+		const harvest = new Map();
+		await batchParallel(targets, 5, async email => {
+			let mails;
+			try {
+				mails = await fetchSearchByKeyword(email);
+			} catch (e) {
+				mails = [];
+			}
+			if (mails.length === 0) return;
+
+			const id = ensureIdentity(email);
+			const subjects = [];
+			let nick = '';
+			for (const m of mails) {
+				const n = m.senders?.item?.[0]?.nick;
+				if (n) {
+					id.nicks.add(n);
+					if (!nick) nick = n;
+				}
+				const subject = m.subject || '';
+				if (subject) {
+					applySubjectToIdentity(id, subject);
+					subjects.push(subject);
+				}
+			}
+			harvest.set(email, { nick, subjects });
+		});
+
+		// AI 不可用时下面的 fuzzy 兜底直接跳过，仅返回 stage1 regex 的成果。
+		const aiReady = aiReadyPromise ? await aiReadyPromise : aiAvailable;
+
+		// Stage 2：仅 fuzzy hit（regex 拿到 qq/phone 但没名字）走 LLM，每发件人 1 次。
+		const items = [];
+		for (const email of targets) {
+			const h = harvest.get(email);
+			if (!h) continue;
+			const before = getIdentity(email);
+			let aiParsed = null;
+			let aiSubject = '';
+			if (!before.name && (before.qq || before.phone) && aiReady) {
+				aiSubject = pickRichestSubject(h.subjects);
+				if (aiSubject) {
+					const id = ensureIdentity(email);
+					id.aiTried = true;
+					const parsed = await aiParseSubject(aiSubject);
+					if (parsed) {
+						applyParsedToIdentity(id, parsed);
+						aiParsed = parsed;
+					}
+				}
+			}
+
+			const after = getIdentity(email);
+			const improved = (after.name && !before.name) || (after.qq && !before.qq) || (after.phone && !before.phone);
+			if (!improved) continue;
+
+			items.push({
+				email,
+				nick: h.nick,
+				subject: aiSubject || h.subjects[0] || '',
+				parsed: {
+					name: after.name,
+					qq: after.qq,
+					phone: after.phone,
+					work: aiParsed?.work || '',
+				},
+				source: aiParsed ? 'search+ai' : 'search',
+			});
+		}
+
 		const count = items.filter(it => it.parsed.name).length;
 		return { count, items };
 	}
@@ -813,6 +1081,15 @@
 				// nameless files. Last resort is mailIdx.
 				const baseSegs = idSegs.length > 0 ? idSegs : [senderEmail.split('@')[0] || `mail${mailIdx}`];
 
+				// SAVE_MODE-aware：在 'type' 模式下保留独立的 DIR_INLINE 目录，其他模式则与普通图片合并到 bucket。
+				const inlineMailInfo = {
+					subject: mail.subject || '',
+					senderEmail,
+					senderNick: getSenderNick(mail),
+					totime: mail.totime,
+				};
+				const inlineDir = resolveSaveDir(DIR_INLINE, { email: senderEmail }, inlineMailInfo);
+
 				for (let pi = 0; pi < picList.length; pi++) {
 					const pic = picList[pi];
 					let ext = 'jpg';
@@ -828,13 +1105,15 @@
 					inlineEntries.push({
 						url: ensureAbsoluteUrl(pic.downloadurl || ''),
 						folderId,
-						dir: DIR_INLINE,
+						category: DIR_INLINE,
+						dir: inlineDir,
 						filename,
 						mailid: mail.emailid,
 						fileid: pic.fileid || `inline_${pi}`,
 						fileIndex: pi + 1,
 						email: senderEmail,
 						quanpin: getQuanpin(senderEmail),
+						origName: pic.name || '',
 						size: pic.size || 0,
 						isInline: true,
 						senderEmail,
@@ -926,6 +1205,13 @@
 		}
 	}
 
+	const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'bmp', 'tiff', 'tif', 'raw', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'raf']);
+	const PROJECT_EXTS = new Set(['psd', 'ai', 'sketch', 'fig', 'xd', 'cdr', 'eps', 'afdesign', 'afphoto', 'blend', 'c4d', 'max']);
+	const DOC_EXTS = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'md', 'epub']);
+	const AUDIO_EXTS = new Set(['mp3', 'wav', 'aac', 'flac', 'ogg', 'wma', 'm4a', 'ape', 'alac']);
+	const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'mpg', 'mpeg', 'm4v', 'gif']);
+	const ARCHIVE_EXTS = new Set(['zip', 'rar', '7z', 'gz', 'tar', 'bz2', 'xz', 'zst']);
+
 	function classifyExt(ext) {
 		if (ARCHIVE_EXTS.has(ext)) return DIR_ARCHIVE;
 		if (IMAGE_EXTS.has(ext)) return DIR_IMAGE;
@@ -937,23 +1223,31 @@
 	}
 
 	function buildDownloadListFromAttach(attachments) {
-		// Duplicates keyed by sender_email + file_size; newest (by ctime) wins within each group.
+		// Duplicates keyed by sender_email + file_size + NFC-normalized filename; newest
+		// (by ctime) wins within each group. Size alone overmatches — two unrelated JPGs
+		// from the same sender can coincidentally share byte count (same camera/template),
+		// so the name must match too. Auto-generated names (微信图片_xxx, mmexport, IMG_xxx,
+		// Screenshot_xxx, DSC_xxx) are skipped entirely: their timestamp/sequence parts
+		// vary on every re-share, and same-pattern names from one sender are usually
+		// different works — name clashes get resolved by the collision-rename pass below.
 		const ssMap = new Map();
 		for (const a of attachments) {
-			const k = `${a.sender?.addr || ''}_${a.size}`;
+			const nameKey = String(a.name || '').normalize('NFC');
+			if (isAutoGenNfcName(nameKey)) continue;
+			const k = `${a.sender?.addr || ''}_${a.size}_${nameKey}`;
 			if (!ssMap.has(k)) ssMap.set(k, []);
 			ssMap.get(k).push({ t: a.ctime, eid: a.mailid, fid: a.fileid });
 		}
 		const dupKeys = new Set();
 		const dupGroupMap = new Map();
-		const dupKeptMap = new Map();
+		const dupGroupInfo = new Map();
 		for (const [groupKey, items] of ssMap) {
 			if (items.length > 1) {
 				items.sort((a, b) => b.t - a.t);
-				const kept = items[0];
-				dupKeptMap.set(groupKey, `${kept.eid}_${kept.fid}`);
+				const dups = items.slice(1);
 				for (const item of items) dupGroupMap.set(`${item.eid}_${item.fid}`, groupKey);
-				for (let i = 1; i < items.length; i++) dupKeys.add(`${items[i].eid}_${items[i].fid}`);
+				for (const it of dups) dupKeys.add(`${it.eid}_${it.fid}`);
+				dupGroupInfo.set(groupKey, { kept: items[0], dups });
 			}
 		}
 
@@ -1014,12 +1308,13 @@
 			})();
 			const isThirdParty = downloadHost && !downloadHost.endsWith('mail.qq.com') && !downloadHost.endsWith('qq.com');
 
-			let dir;
-			if (dupKeys.has(dk)) dir = DIR_DUP;
-			else if (isThirdParty) dir = DIR_MANUAL;
-			else dir = classifyExt(ext);
+			let category;
+			if (dupKeys.has(dk)) category = DIR_DUP;
+			else if (isThirdParty) category = DIR_MANUAL;
+			else category = classifyExt(ext);
 
 			const sender = a.sender?.addr || '';
+			const dir = resolveSaveDir(category, { email: sender }, mailMap[a.mailid]);
 
 			// Priority: (1) filename already has identity token → keep as-is;
 			// (2) sender has compliant siblings → mirror their prefix; (3) synthesize from identity map.
@@ -1044,6 +1339,7 @@
 				id: id++,
 				folderId,
 				url,
+				category,
 				dir,
 				filename,
 				mailid: a.mailid,
@@ -1051,15 +1347,32 @@
 				fileIndex,
 				email: sender,
 				quanpin: getQuanpin(sender),
+				origName: a.name || '',
 				status: 'pending',
 			};
 			const gk = dupGroupMap.get(dk);
-			if (gk) {
-				task.dupGroup = gk;
-				if (dupKeys.has(dk)) task.keptBy = dupKeptMap.get(gk);
-			}
+			if (gk) task.dupGroup = gk;
 
 			downloads.push(task);
+		}
+
+		// 互链：保留方挂出被替代清单，每个重复方挂回保留方引用。
+		// manifest 序列化时只取需要的字段（见 buildManifestVal）。
+		const taskByDk = new Map();
+		for (const t of downloads) taskByDk.set(`${t.mailid}_${t.fileid}`, t);
+		for (const [, info] of dupGroupInfo) {
+			const keptTask = taskByDk.get(`${info.kept.eid}_${info.kept.fid}`);
+			if (!keptTask) continue;
+			const dupTasks = info.dups.map(d => taskByDk.get(`${d.eid}_${d.fid}`)).filter(Boolean);
+			keptTask.dupCount = dupTasks.length;
+			keptTask.dupReplaced = dupTasks.map(t => ({
+				key: buildManifestKey(t),
+				dir: t.dir,
+				filename: t.filename,
+				mailid: t.mailid,
+				fileid: t.fileid,
+			}));
+			for (const dt of dupTasks) dt.keptTask = keptTask;
 		}
 
 		// Two-fold dedup: (1) Windows + macOS default FS are case-insensitive, so
@@ -1115,22 +1428,43 @@
 	let manifestDirty = false;
 	let manifestFlushTimer = null;
 
-	// Debounce: coalesce bursts of appends from parallel workers into at most one write per 2s.
-	async function manifestAppend(entry) {
-		if (!manifestCache) manifestCache = await readManifest();
-		const key = buildManifestKey(entry);
+	function buildManifestVal(task, size) {
+		const mailInfo = mailMap[task.mailid] || {};
 		const val = {
-			emailid: entry.mailid,
-			fileid: entry.fileid,
-			file_index: entry.fileIndex,
-			email: entry.email,
-			dir: entry.dir,
-			filename: entry.filename,
-			size: entry.size,
+			emailid: task.mailid,
+			fileid: task.fileid,
+			file_index: task.fileIndex,
+			email: task.email,
+			dir: task.dir,
+			filename: task.filename,
+			size,
 			time: Date.now(),
 		};
-		if (entry.keptBy) val.keptBy = entry.keptBy;
-		manifestCache[key] = val;
+		if (task.origName && task.origName !== task.filename) val.orig_name = task.origName;
+		if (mailInfo.subject) val.mail_subject = mailInfo.subject;
+		if (mailInfo.senderNick) val.sender_name = mailInfo.senderNick;
+		if (mailInfo.totime) val.mail_time = mailInfo.totime;
+		if (task.dupGroup) val.dup_group = task.dupGroup;
+		const kept = task.keptTask;
+		if (kept) {
+			// 重复方：记录“获胜者”落位，便于不再重跑管线就能从 `重复/` 反查关联。
+			val.dup_role = 'duplicate';
+			val.kept_by = `${kept.mailid}_${kept.fileid}`;
+			val.kept_by_key = buildManifestKey(kept);
+			val.kept_filename = kept.filename;
+			val.kept_dir = kept.dir;
+		} else if (task.dupGroup) {
+			val.dup_role = 'kept';
+			if (typeof task.dupCount === 'number') val.dup_count = task.dupCount;
+			if (Array.isArray(task.dupReplaced) && task.dupReplaced.length) val.dup_replaced = task.dupReplaced;
+		}
+		return val;
+	}
+
+	// Debounce: coalesce bursts of appends from parallel workers into at most one write per 2s.
+	async function manifestAppend(task, size) {
+		if (!manifestCache) manifestCache = await readManifest();
+		manifestCache[buildManifestKey(task)] = buildManifestVal(task, size);
 		manifestDirty = true;
 
 		if (!manifestFlushTimer) {
@@ -1155,20 +1489,101 @@
 		}
 	}
 
+	// Drop a `重复/_DUPLICATE_INDEX.md` next to the duplicate files themselves so anyone
+	// browsing the folder can see which kept-side file each duplicate corresponds to —
+	// without leaving the directory to consult manifest.json or report.md.
+	async function writeDuplicateIndex(tasks) {
+		const dups = tasks.filter(t => (t.category || t.dir) === DIR_DUP && t.dupGroup);
+		if (dups.length === 0) return;
+		const groups = new Map();
+		for (const t of tasks) {
+			if (!t.dupGroup) continue;
+			if (!groups.has(t.dupGroup)) groups.set(t.dupGroup, []);
+			groups.get(t.dupGroup).push(t);
+		}
+		const lines = [];
+		lines.push(`# 重复投稿索引`);
+		lines.push(``);
+		lines.push(`> 共 ${groups.size} 组重复，${dups.length} 个被替代的附件。`);
+		lines.push(`> 判定规则：sender_email + file_size 相同 → 按邮件时间保留最新。`);
+		lines.push(``);
+		let gi = 0;
+		for (const [, group] of groups) {
+			group.sort((a, b) => {
+				const aCat = a.category || a.dir;
+				const bCat = b.category || b.dir;
+				if (aCat !== DIR_DUP && bCat === DIR_DUP) return -1;
+				if (aCat === DIR_DUP && bCat !== DIR_DUP) return 1;
+				const ta = mailMap[a.mailid]?.totime || 0;
+				const tb = mailMap[b.mailid]?.totime || 0;
+				return tb - ta;
+			});
+			gi++;
+			lines.push(`## 组 ${gi}`);
+			lines.push(``);
+			lines.push(`| 角色 | 路径 | 发件人 | 邮箱 | 主题 | 邮件时间 |`);
+			lines.push(`|------|------|--------|------|------|----------|`);
+			for (const t of group) {
+				const info = mailMap[t.mailid] || {};
+				const role = (t.category || t.dir) !== DIR_DUP ? '● 保留' : '○ 重复';
+				const path = `${t.dir}/${t.filename}`;
+				lines.push(`| ${role} | ${escapeMd(path)} | ${escapeMd(info.senderNick)} | ${escapeMd(info.senderEmail)} | ${escapeMd(truncate(info.subject, 30))} | ${fmtDatetime(info.totime)} |`);
+			}
+			lines.push(``);
+		}
+		try {
+			// _DUPLICATE_INDEX.md 始终放在 重复/ 顶层，便于人工审核（即便内部还按 bucket 分子目录）。
+			const dh = await rootHandle.getDirectoryHandle(DIR_DUP, { create: true });
+			const fh = await dh.getFileHandle('_DUPLICATE_INDEX.md', { create: true });
+			const w = await fh.createWritable();
+			await w.write(lines.join('\n'));
+			await w.close();
+		} catch (e) {
+			console.error('[QQMail DL] Failed to write duplicate index:', e);
+		}
+	}
+
 	// ============================================================
 	//  Phase 8: Audit report
 	// ============================================================
 
+	// 缺省 detailTitle → 报告里有专属段落（DUP / MANUAL），而非普通清单。
+	const DIR_META = [
+		{ name: DIR_IMAGE, desc: 'jpg/png/webp/heic/ 等', detailTitle: '图片清单' },
+		{ name: DIR_INLINE, desc: '正文嵌入图片', detailTitle: '内嵌图片清单' },
+		{ name: DIR_PROJECT, desc: 'psd/ai/sketch/xd 等', detailTitle: '项目文件清单' },
+		{ name: DIR_DOC, desc: 'pdf/doc/xls/ppt 等', detailTitle: '文档清单' },
+		{ name: DIR_AUDIO, desc: 'mp3/wav/flac 等', detailTitle: '音频清单' },
+		{ name: DIR_VIDEO, desc: 'mp4/mov/avi 等', detailTitle: '视频清单' },
+		{ name: DIR_ARCHIVE, desc: 'zip/rar/7z 等', detailTitle: '压缩文件清单' },
+		{ name: DIR_DUP, desc: '已保留最新' },
+		{ name: DIR_OTHER, desc: '未归类格式', detailTitle: '其他文件清单' },
+		{ name: DIR_MANUAL, desc: '第三方链接' },
+	];
+
+	function countByDir(tasks) {
+		const s = {};
+		for (const t of tasks) {
+			const cat = t.category || t.dir;
+			s[cat] = (s[cat] || 0) + 1;
+		}
+		return s;
+	}
+
+	function formatDirStats(stats) {
+		return DIR_META.map(({ name }) => (name === DIR_IMAGE ? `${name} ${stats[name] || 0}` : stats[name] ? `${name} ${stats[name]}` : '')).filter(Boolean);
+	}
+
 	async function generateReport(tasks, pipelineStats) {
-		const d = new Date();
-		const now = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+		const now = fmtDatetime(Date.now() / 1000);
 		const done = tasks.filter(t => t.status === 'done');
 		const failed = tasks.filter(t => t.status === 'failed');
 
 		const byDir = {};
 		for (const t of tasks) {
-			byDir[t.dir] = byDir[t.dir] || [];
-			byDir[t.dir].push(t);
+			const cat = t.category || t.dir;
+			byDir[cat] = byDir[cat] || [];
+			byDir[cat].push(t);
 		}
 
 		const lines = [];
@@ -1252,17 +1667,13 @@
 				dupGroups.get(t.dupGroup).push(t);
 			}
 
-			const fmtTime = ts => {
-				if (!ts) return '';
-				const d = new Date(ts * 1000);
-				return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-			};
-
 			let groupIdx = 0;
 			for (const [, group] of dupGroups) {
 				group.sort((a, b) => {
-					if (a.dir !== DIR_DUP && b.dir === DIR_DUP) return -1;
-					if (a.dir === DIR_DUP && b.dir !== DIR_DUP) return 1;
+					const aCat = a.category || a.dir;
+					const bCat = b.category || b.dir;
+					if (aCat !== DIR_DUP && bCat === DIR_DUP) return -1;
+					if (aCat === DIR_DUP && bCat !== DIR_DUP) return 1;
 					const ta = mailMap[a.mailid]?.totime || 0;
 					const tb = mailMap[b.mailid]?.totime || 0;
 					return tb - ta;
@@ -1270,13 +1681,14 @@
 				groupIdx++;
 				lines.push(`### 重复组 ${groupIdx}`);
 				lines.push(``);
-				lines.push(`| 状态 | 文件名 | 发件人 | 邮箱 | 主题 | 时间 |`);
-				lines.push(`|------|--------|--------|------|------|------|`);
+				lines.push(`| 状态 | 路径 | 发件人 | 邮箱 | 主题 | 时间 |`);
+				lines.push(`|------|------|--------|------|------|------|`);
 				for (const t of group) {
 					const info = mailMap[t.mailid] || {};
-					const kept = t.dir !== DIR_DUP ? '● 保留' : '○ 重复';
+					const kept = (t.category || t.dir) !== DIR_DUP ? '● 保留' : '○ 重复';
 					const subject = truncate(info.subject, 25);
-					lines.push(`| ${kept} | ${escapeMd(t.filename)} | ${escapeMd(info.senderNick)} | ${escapeMd(info.senderEmail)} | ${escapeMd(subject)} | ${fmtTime(info.totime)} |`);
+					const path = `${t.dir}/${t.filename}`;
+					lines.push(`| ${kept} | ${escapeMd(path)} | ${escapeMd(info.senderNick)} | ${escapeMd(info.senderEmail)} | ${escapeMd(subject)} | ${fmtDatetime(info.totime)} |`);
 				}
 				lines.push(``);
 			}
@@ -1389,10 +1801,13 @@
 		if (engineRunning) return;
 		engineRunning = true;
 
-		const dirCache = {};
-		async function getDirHandle(name) {
-			if (!dirCache[name]) dirCache[name] = await rootHandle.getDirectoryHandle(name, { create: true });
-			return dirCache[name];
+		const dirCache = new Map();
+		async function getDirHandle(relPath) {
+			const cached = dirCache.get(relPath);
+			if (cached) return cached;
+			const handle = await resolveDirHandle(rootHandle, relPath, { create: true });
+			dirCache.set(relPath, handle);
+			return handle;
 		}
 
 		async function downloadOne(task) {
@@ -1419,7 +1834,7 @@
 				await w.write(blob);
 				await w.close();
 				task.status = 'done';
-				await manifestAppend({ mailid: task.mailid, fileid: task.fileid, fileIndex: task.fileIndex, email: task.email, quanpin: task.quanpin, dir: task.dir, filename: task.filename, size: blob.size, keptBy: task.keptBy });
+				await manifestAppend(task, blob.size);
 			} catch (e) {
 				if (e.message === 'session_expired') throw e; // bubble up for retry; caller requeues
 				task.status = 'failed';
@@ -1528,19 +1943,21 @@
 	function renderAIEnhanceDetails(items) {
 		if (!items || items.length === 0) return '';
 		const fmtField = (label, val) => (val ? `<span style="display:inline-block;margin-right:10px;"><span style="color:rgba(20,46,77,0.45);">${label}</span>${escapeHtml(val)}</span>` : '');
+		const sourceLabel = src => (src === 'search' ? '搜索' : src === 'search+ai' ? '搜索+AI' : 'AI');
 		const rows = items
 			.map(it => {
 				const fields = [fmtField('姓名 ', it.parsed.name), fmtField('QQ ', it.parsed.qq), fmtField('手机 ', it.parsed.phone), fmtField('作品 ', it.parsed.work && truncate(it.parsed.work, 18))].filter(Boolean).join('');
 				const sender = escapeHtml(it.nick || it.email.split('@')[0]);
 				const subject = escapeHtml(truncate(it.subject || '', 36));
+				const tag = `<span style="display:inline-block;padding:0 4px;margin-right:6px;background:rgba(20,46,77,0.08);border-radius:3px;font-size:11px;color:rgba(20,46,77,0.6);">${sourceLabel(it.source)}</span>`;
 				return `<div style="padding:6px 0;border-top:1px solid rgba(20,46,77,0.06);">
-				<div style="font-size:12px;color:rgba(20,46,77,0.5);">${sender} · ${subject}</div>
+				<div style="font-size:12px;color:rgba(20,46,77,0.5);">${tag}${sender} · ${subject}</div>
 				<div style="font-size:12px;color:rgba(20,46,77,0.75);margin-top:2px;">${fields || '<span style="color:rgba(20,46,77,0.35);">未提取到字段</span>'}</div>
 			</div>`;
 			})
 			.join('');
 		return `<details style="margin-top:8px;font-size:13px;">
-			<summary style="cursor:pointer;color:rgba(20,46,77,0.55);user-select:none;">AI 解析 ${items.length} 条记录（点开查看详情）</summary>
+			<summary style="cursor:pointer;color:rgba(20,46,77,0.55);user-select:none;">身份补全 ${items.length} 条记录（点开查看详情）</summary>
 			<div style="margin:4px 0 0;">${rows}</div>
 		</details>`;
 	}
@@ -1823,14 +2240,21 @@
 
 		const markUnreadPromise = markAllUnread();
 
-		const aiReady = await initBuiltinAI();
-		let aiEnhancedCount = 0;
-		let aiEnhancedItems = [];
+		// Identity enrichment runs invisibly: search starts immediately alongside
+		// AI init, and stage 2 inside the search awaits aiReadyPromise — so the
+		// user only sees the existing "AI 增强解析" step, never a separate "搜索" one.
+		const aiReadyPromise = initBuiltinAI();
+		const searchPromise = enrichIdentityFromSearch(allMails, aiReadyPromise);
+
+		const [aiReady, searchResult] = await Promise.all([aiReadyPromise, searchPromise]);
+		let aiEnhancedCount = searchResult.count;
+		let aiEnhancedItems = [...searchResult.items];
+
 		if (aiReady) {
 			updateScanMessage('AI 增强解析...');
 			const result = await enhanceIdentityWithAI(allMails, updateScanMessage);
-			aiEnhancedCount = result.count;
-			aiEnhancedItems = result.items;
+			aiEnhancedCount += result.count;
+			aiEnhancedItems.push(...result.items);
 		}
 
 		updateScanMessage(`检查撤回和空邮件...`);
@@ -1902,7 +2326,7 @@
 		for (const dirName of dirNames) {
 			const fileMap = new Map();
 			try {
-				const dh = await rootHandle.getDirectoryHandle(dirName, { create: false });
+				const dh = await resolveDirHandle(rootHandle, dirName, { create: false });
 				// Walk subfolders too when SCAN_SUBFOLDERS is on — users often archive
 				// into 图片/2026-03/ etc. Match by bare filename so a moved file still
 				// counts as already-downloaded.
@@ -1936,16 +2360,7 @@
 				if (!inManifest) {
 					try {
 						const file = await fileHandle.getFile();
-						manifestCache[mKey] = {
-							emailid: task.mailid,
-							fileid: task.fileid,
-							file_index: task.fileIndex,
-							email: task.email,
-							dir: task.dir,
-							filename: task.filename,
-							size: file.size,
-							time: Date.now(),
-						};
+						manifestCache[mKey] = buildManifestVal(task, file.size);
 						manifestRebuilt = true;
 					} catch {}
 				}
@@ -2016,6 +2431,9 @@
 		updateScanMessage('标记已下载...');
 		const doneMails = [...new Set(downloads.filter(t => t.status === 'done').map(t => t.mailid))];
 		await batchParallel(doneMails, 10, mid => addTag(mid, TAG_DOWNLOADED).catch(() => {}));
+
+		await tagDuplicateMails(downloads, n => updateScanMessage(`标记重复 ${n} 封...`));
+		await writeDuplicateIndex(downloads);
 
 		await onDownloadComplete(downloads, mailCount, pipelineStats);
 	}
@@ -2145,6 +2563,10 @@
 		showProgressUI(actualDone, total, 0, mc);
 		const tracker = createProgressTracker(total, actualDone);
 		await startEngine(actualPending, task => tracker.onTask(task));
+
+		// resume 不重生成 report.md，但重复索引贴在文件旁，每次都从 allTasks 重派——成本低。
+		await tagDuplicateMails(allTasks);
+		await writeDuplicateIndex(allTasks);
 	}
 
 	async function retryFailed(failedTasks) {
