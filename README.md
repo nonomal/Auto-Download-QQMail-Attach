@@ -37,6 +37,7 @@
 | `SCAN_SUBFOLDERS` | `true` | 扫描已下载时是否递归子目录 |
 | `CONCURRENCY` | `10` | 并发下载数 |
 | `SAVE_MODE` | `'type'` | 落盘目录组织方式，见下表 |
+| `RENAME_WITH_IDENTITY` | `null` | 是否提取身份信息（姓名/QQ/手机）补充文件名前缀。`null` = 保留原始附件名、跳过搜索/AI 解析；`true` = 拼成「姓名-QQ-手机-原名」 |
 | `TAG_NO_ATTACH` | `null` | 给无附件邮件打的标签 ID |
 | `TAG_READ` | `null` | 给已读邮件打的标签 ID |
 | `TAG_DOWNLOADED` | `null` | 给已下载邮件打的标签 ID |

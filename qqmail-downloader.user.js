@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QQ Mail 附件批量下载
 // @description  批量下载QQ邮箱附件，提取全部附件，智能分类命名
-// @version      3.4.0
+// @version      3.4.1
 // @author       XHXIAIEIN
 // @namespace    https://greasyfork.org/zh-CN/scripts/535160
 // @supportURL   https://github.com/xhxiaiein/Auto-Download-QQMail-Attach
@@ -20,18 +20,22 @@
 	const SCAN_SUBFOLDERS = true; // 扫描已下载时是否递归子目录
 	const CONCURRENCY = 10; // 并发下载数
 
+	// 是否启用「提取身份信息补充前缀」重命名。
+	// true — 从邮件主题/搜索历史/其他附件中提取姓名/QQ/手机，拼成「姓名-QQ-手机-原名.ext」
+	const RENAME_WITH_IDENTITY = null;
+
 	// 落盘目录组织方式
 	//   'type'        默认。按文件类型一级分类：图片/、文档/、视频/...
 	//   'subject'     按邮件主题
-	//   'sender'      按发件人昵称（缺省回退到邮箱 local-part）
 	//   'email'       按完整发件人邮箱地址
+	//   'sender'      按发件人昵称。注意：同一发件人不同邮件的昵称可能不一致，且特殊字符会被替换成 '_'
 	//   'pinyin'      按发件人 pinyin 首字母：A-Z / 0-9 / _其他
 	//   'time-month'  按月：YYYY-MM
 	//   'time-week'   按周：YYYY-Www
 	//   'time-day'    按日：YYYY-MM-DD
 	//   'time-hour'   按小时：YYYY-MM-DD-HH
 	//   'time-period' 按时段：YYYY-MM-DD-上午/下午/晚上（5/12/18 三段）
-	const SAVE_MODE = 'type';
+	const SAVE_MODE = 'subject';
 
 	// QQ 邮箱标签 ID（按需启用）。默认 null = 不打。
 	// 启用：邮箱里建标签 → 打开它 → 把 URL 里的 tagid 填进来。填错或不存在会自动跳过。
@@ -1075,11 +1079,18 @@
 				// Only TAG_NO_ATTACH here — TAG_DOWNLOADED is applied after all its inline pics download.
 				await addTag(mail.emailid, TAG_NO_ATTACH);
 
-				const identity = getIdentity(senderEmail);
-				const idSegs = buildIdentitySegs(identity);
 				// Identity-empty fallback: use sender's local-part so we never produce
 				// nameless files. Last resort is mailIdx.
-				const baseSegs = idSegs.length > 0 ? idSegs : [senderEmail.split('@')[0] || `mail${mailIdx}`];
+				// RENAME_WITH_IDENTITY 关闭时直接走 fallback：内嵌图原文件名（image001.png 之类）
+				// 没有辨识度，至少要带 local-part 才能区分发件人。
+				let baseSegs;
+				if (RENAME_WITH_IDENTITY) {
+					const identity = getIdentity(senderEmail);
+					const idSegs = buildIdentitySegs(identity);
+					baseSegs = idSegs.length > 0 ? idSegs : [senderEmail.split('@')[0] || `mail${mailIdx}`];
+				} else {
+					baseSegs = [senderEmail.split('@')[0] || `mail${mailIdx}`];
+				}
 
 				// SAVE_MODE-aware：在 'type' 模式下保留独立的 DIR_INLINE 目录，其他模式则与普通图片合并到 bucket。
 				const inlineMailInfo = {
@@ -1318,8 +1329,11 @@
 
 			// Priority: (1) filename already has identity token → keep as-is;
 			// (2) sender has compliant siblings → mirror their prefix; (3) synthesize from identity map.
+			// 当 RENAME_WITH_IDENTITY 关闭时，整条链路跳过，附件保留原始名。
 			let filename;
-			if (hasConventionDigits(origName)) {
+			if (!RENAME_WITH_IDENTITY) {
+				filename = (origName || 'unnamed') + '.' + ext;
+			} else if (hasConventionDigits(origName)) {
 				filename = (origName || 'unnamed') + '.' + ext;
 			} else if (senderPrefix.has(sender)) {
 				filename = senderPrefix.get(sender) + (origName || 'unnamed') + '.' + ext;
@@ -2243,18 +2257,24 @@
 		// Identity enrichment runs invisibly: search starts immediately alongside
 		// AI init, and stage 2 inside the search awaits aiReadyPromise — so the
 		// user only sees the existing "AI 增强解析" step, never a separate "搜索" one.
-		const aiReadyPromise = initBuiltinAI();
-		const searchPromise = enrichIdentityFromSearch(allMails, aiReadyPromise);
+		// RENAME_WITH_IDENTITY 关闭时整段重活全部跳过：搜索批量调 cgi、AI 解析吃显存，
+		// 不打前缀就没必要花这份钱。
+		let aiEnhancedCount = 0;
+		let aiEnhancedItems = [];
+		if (RENAME_WITH_IDENTITY) {
+			const aiReadyPromise = initBuiltinAI();
+			const searchPromise = enrichIdentityFromSearch(allMails, aiReadyPromise);
 
-		const [aiReady, searchResult] = await Promise.all([aiReadyPromise, searchPromise]);
-		let aiEnhancedCount = searchResult.count;
-		let aiEnhancedItems = [...searchResult.items];
+			const [aiReady, searchResult] = await Promise.all([aiReadyPromise, searchPromise]);
+			aiEnhancedCount = searchResult.count;
+			aiEnhancedItems = [...searchResult.items];
 
-		if (aiReady) {
-			updateScanMessage('AI 增强解析...');
-			const result = await enhanceIdentityWithAI(allMails, updateScanMessage);
-			aiEnhancedCount += result.count;
-			aiEnhancedItems.push(...result.items);
+			if (aiReady) {
+				updateScanMessage('AI 增强解析...');
+				const result = await enhanceIdentityWithAI(allMails, updateScanMessage);
+				aiEnhancedCount += result.count;
+				aiEnhancedItems.push(...result.items);
+			}
 		}
 
 		updateScanMessage(`检查撤回和空邮件...`);
